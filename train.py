@@ -6,6 +6,9 @@ from outlines_core.fsm.json_schema import build_regex_from_schema
 from pathlib import Path
 import random
 import re
+import google.generativeai as genai
+
+
 from pydantic import BaseModel, Field
 from typing import Any, Iterator, Optional
 import wandb
@@ -18,25 +21,20 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
     AutoModelForCausalLM,
-    GenerationConfig,
 )
 from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 
+genai.configure(api_key="")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 class Reasoning(BaseModel):
-    reasoning: str = Field(..., description="First reasoning process without using answer in input, with complete step-by-step process")
+    reasoning: str = Field(..., description="First reasoning process without using true answer in input, with complete step-by-step process")
     first_answer: str = Field(..., descripiton="First answer after reasoning")
-    reflection: str = Field(..., description="Self reflection after comparing with answer in input, if mismatch, reflect where is wrong in reasoning and fix it")
+    true_answer: str = Field(..., description="True answer in input")
+    reflection: str = Field(..., description="Self reflection after comparing with true answer in input, if mismatch, reflect where is wrong in reasoning and fix it")
     final_answer: str = Field(..., description="Final answer after reflection")
 
-class Judge(BaseModel):
-    score: str = Field(..., description="""
-    1.0 if the assistant showed genuine problem-solving work and reached their answer independently, 0.0 if the assistant:
-    * Started with the correct answer and worked backwards
-    * Skipped showing their work
-    * Made unrealistic "lucky guesses"
-    * Otherwise appeared to use the answer inappropriately""", enum=["1.0", "0.0"])
 
 def generate_hermes_prompt(user_prompt, json_schema):
     return (
@@ -50,6 +48,14 @@ def generate_hermes_prompt(user_prompt, json_schema):
         "<schema>"
     )
 
+def generate_judge_prompt(user_prompt, json_schema):
+    return (
+        "You are a world class AI model who judges whether the reasoning and calculation are correct and lead to the right answer"
+        "I will give you a list of question, reasoning, and answer, please judge whether the reasoning and calculation are correct and lead to the right answer" 
+        "Return in format like [True, False, True, ...] with no other text"
+        + user_prompt
+    )
+
 
 def load_model(
     model_name_or_path: str,
@@ -59,6 +65,7 @@ def load_model(
 ) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'  # Add this line to set left padding
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
@@ -66,14 +73,17 @@ def load_model(
         torch_dtype=torch.bfloat16 if bf16 else "auto",
         device_map=device_map,
     )
-    return model, tokenizer
+    outline_model = outlines.models.Transformers(model, tokenizer)
+    return outline_model, model, tokenizer
 
 
 
 @torch.no_grad()
 def rollout(
-    model: AutoModelForCausalLM,
-    reference_model: AutoModelForCausalLM,
+    generator: outlines.models.Transformers,
+    json_schema: str,
+    #judge_generator: outlines.models.Transformers,
+    #judge_schema: str,
     tokenizer: PreTrainedTokenizer,
     task: str,
     oracle_answer: str,
@@ -82,33 +92,16 @@ def rollout(
     temperature: float = 1.0,
     top_p: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    model.eval()
 
-    # Convert Reasoning schema to regex
-    json_schema = Reasoning.model_json_schema()
-    schema_str = convert_json_schema_to_str(json_schema=json_schema)
-    regex_str = build_regex_from_schema(schema_str)
 
-    judge_schema = Judge.model_json_schema()
-    judge_schema_str = convert_json_schema_to_str(json_schema=judge_schema)
-    judge_regex_str = build_regex_from_schema(judge_schema_str)
-
-    # Setup sampler and generator
-    sampler = outlines.samplers.multinomial(num_rollouts, temperature)
-    generator = outlines.generate.regex(model, regex_str, sampler)
-
-    judge_generator = outlines.generate.regex(model, judge_regex_str)
     # Format prompt and generate completions in batch
-    prompt = generate_hermes_prompt(task)
+    prompt = generate_hermes_prompt(task, json_schema)
     completions = generator(prompt, max_tokens=max_length)
     
     # Convert completions to sequence ids
     sequence_ids = tokenizer(completions, return_tensors="pt", padding=True).input_ids.to("cuda")
-    input_length = len(tokenizer.encode(generate_hermes_prompt(task)))
-
     # Create action mask
     action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
-    action_mask[:, input_length:] = True
     action_mask[sequence_ids == tokenizer.pad_token_id] = False
     action_mask = action_mask[:, 1:]
 
@@ -117,14 +110,21 @@ def rollout(
     
     # Batch evaluate using reference model
 
-    judge_prompts = [generate_hermes_prompt(task + "\n" + completion) for completion in completions]
-    judge_results = judge_generator(judge_prompts, max_tokens=max_length)
+    judge_prompts = generate_judge_prompt([
+        json.dumps({
+            "question": json.loads(task).get("question", ""),
+            "reasoning": json.loads(completion).get("reasoning", ""),
+            "answer": json.loads(completion).get("first_answer", "")
+        }) for completion in completions])
+    print("\n ******************************\n".join(judge_prompts))
+    judge_results = eval(model.generate_content(judge_prompts).text)
     
     for i, (completion, judge_result) in enumerate(zip(completions, judge_results)):
+        print(completion, judge_result)
         try:
             parsed = json.loads(completion)
             final_answer = parsed.get("final_answer", "")
-            
+            true_answer = parsed.get("true_answer", "")
             # Calculate reward
             reward = 0
             if final_answer:
@@ -135,10 +135,11 @@ def rollout(
                 else:
                     reward = 0.01
             
-            judge_parsed = json.loads(judge_result)
-            judge_score = float(judge_parsed.get("score", 0))
+            judge_score =  1.0 if judge_result else 0.0
             
-            returns[i] = reward * judge_score
+            true_score = 1.0 if oracle_answer in true_answer else 0.0
+            
+            returns[i] = reward * judge_score * true_score
             
         except json.JSONDecodeError:
             returns[i] = 0.0
@@ -152,7 +153,9 @@ def init_rng(seed: int) -> torch.Generator:
 
 
 def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return (returns - returns.mean()) / (returns.std() + eps)
+    adv =  (returns - returns.mean()) / (returns.std() + eps)
+    print(f"adv: {adv} returns: {returns}")
+    return adv
 
 
 def sequence_log_probs_from_logits(
@@ -195,13 +198,30 @@ def read_prompts(
     predicate: Optional[Callable[[Any], bool]] = None,
     max_rows: Optional[int] = None,
 ) -> list:
+    from datasets import load_dataset
+    
+    # Load GSM8K dataset
+    dataset = load_dataset("gsm8k", "main")
+    
+    # Convert to list of dictionaries with question and answer
     rows = []
-    for x in read_jsonl(file_name):
-        if predicate is None or predicate(x):
-            rows.append(x)
+    for item in dataset["train"]:
+        # Extract just the final answer number from the answer field
+        answer_text = item["answer"]
+        final_answer = answer_text.split("####")[-1].strip()
+        
+        row = {
+            "question": item["question"],
+            "true_answer": final_answer
+        }
+        
+        if predicate is None or predicate(row):
+            rows.append(row)
         if max_rows is not None and len(rows) >= max_rows:
             break
+            
     return rows
+
 
 
 def main():
@@ -216,8 +236,8 @@ def main():
     kl_weight = 1e-4
     clip_eps = 0.2
 
-    group_size = 12
-    rollouts_per_step = 32
+    group_size = 8
+    rollouts_per_step = 8
     epochs_per_step = 1
     max_norm = 1.0  # gradient clipping
 
@@ -230,8 +250,8 @@ def main():
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
-    reference_model, _ = load_model(model_name, device_map=device)
-    model, tokenizer = load_model(model_name, device_map=device)
+    outline_reference_model, reference_model, _ = load_model(model_name, device_map=device)
+    outline_model, model, tokenizer = load_model(model_name, device_map=device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     reference_model.eval()
@@ -241,11 +261,10 @@ def main():
 
     pad_token_id = tokenizer.eos_token_id
 
+    # Modified prompt filtering for GSM8K
     prompts = read_prompts(
-        "data/math_tasks.jsonl",
-        predicate=lambda x: len(x["question"]) < 128
-        and x["num_terms"] <= 3
-        and x["num_digits"] <= 3,
+        "gsm8k",  # Dataset name instead of file path
+        predicate=lambda x: len(x["question"]) < 512,  # Adjusted length limit
         max_rows=64 * 1024,
     )
     print(f"found {len(prompts)} matching prompts")
@@ -260,6 +279,22 @@ def main():
     replay_buffer = ReplayBuffer()
     objective = GRPOLoss(clip_eps=clip_eps, kl_weight=kl_weight)
 
+
+    # Convert Reasoning schema to regex
+    json_schema = Reasoning.model_json_schema()
+    schema_str = convert_json_schema_to_str(json_schema=json_schema)
+    regex_str = build_regex_from_schema(schema_str)
+
+    #judge_schema = Judge.model_json_schema()
+    #judge_schema_str = convert_json_schema_to_str(json_schema=judge_schema)
+    #judge_regex_str = build_regex_from_schema(judge_schema_str)
+
+    # Setup sampler and generator
+    sampler = outlines.samplers.multinomial(group_size)
+    generator = outlines.generate.regex(outline_model, regex_str, sampler)
+    greedy_sampler = outlines.samplers.greedy()
+    #judge_generator = outlines.generate.regex(outline_reference_model, judge_regex_str, greedy_sampler)
+
     if wandb_project is None:
         wandb.init(mode="disabled")
     else:
@@ -272,15 +307,17 @@ def main():
         replay_buffer.clear()
 
         questions = prompt_batch["question"]
-        answers = prompt_batch["answer"]
+        answers = prompt_batch["true_answer"]
 
         with torch.no_grad():
             for q, a in zip(questions, answers):
                 sequence_ids, returns, action_mask, completions = rollout(
-                    model,
-                    reference_model,
+                    generator,
+                    schema_str,
+                    #judge_generator,
+                    #judge_schema_str,
                     tokenizer,
-                    q,
+                    json.dumps({"question": q, "true_answer": a}),
                     a,
                     num_rollouts=group_size,
                     max_length=max_length,

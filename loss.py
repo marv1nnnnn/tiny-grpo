@@ -44,12 +44,11 @@ class GRPOLoss(nn.Module):
         log_probs: torch.Tensor,
         experience: Experience,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         old_log_probs = experience.action_log_probs
         log_probs_ref = experience.log_probs_ref
         action_mask = experience.action_mask
         advantages = experience.advantages
-
+        print(f"log_probs: {log_probs}, log_probs_ref: {log_probs_ref}, action_mask: {action_mask} old_log_probs: {old_log_probs}")
         kl = approx_kl_divergence(
             log_probs=log_probs,
             log_probs_ref=log_probs_ref,
