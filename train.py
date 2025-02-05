@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import random
 import re
+from jsonformer import Jsonformer
 from typing import Any, Iterator, Optional
 import wandb
 import torch
@@ -85,6 +86,14 @@ Scoring criteria:
 Please evaluate based on the assistant's problem-solving process, not just whether they got the right answer. Only return 1.0 or 0.0.
 """
 
+json_schema = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "string", "enum": ["1.0", "0.0"]}
+    },
+    "required": ["score"]
+}
+
 @torch.no_grad()
 def rollout(
     model: AutoModelForCausalLM,
@@ -144,43 +153,15 @@ def rollout(
         sequence_ids[:, input_ids.shape[1] :], skip_special_tokens=True
     )
 
-    # Send completions to reference model for evaluation
-    eval_messages = [
-        {
-            "role": "system", 
-            "content": system_prompt_v2
-        },
-        {
-            "role": "user",
-            "content": f"Question: {task}\nCorrect Answer: {oracle_answer}\nAssistant's Response: {completions[0]}"
-        }
-    ]
-    eval_prompt = tokenizer.apply_chat_template(
-        eval_messages, tokenize=False, add_generation_prompt=True
-    )
-    eval_inputs = tokenizer(
-        [eval_prompt] * num_rollouts,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        return_attention_mask=True
-    ).to("cuda")
-    
-    eval_outputs = reference_model.generate(
-        **eval_inputs,
-        generation_config=generation_config
-    )
-    eval_completions = tokenizer.batch_decode(
-        eval_outputs[:, eval_inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True
-    )
-
-
     action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
     action_mask[:, input_ids.shape[1] :] = True
     action_mask[sequence_ids == pad_token_id] = False
     action_mask = action_mask[:, 1:]
 
+    eval_completions = [
+        Jsonformer(model=reference_model, tokenizer=tokenizer, schema=json_schema, prompt=system_prompt_v2 + "\n" + completion).generate()
+        for completion in completions
+    ]
     # 3. determine rewards
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
     for i, (completion, eval_completion) in enumerate(zip(completions, eval_completions)):
@@ -191,7 +172,7 @@ def rollout(
             completion,
             flags=re.DOTALL,
         )
-        eval_result = int(eval_completion) if eval_completion.isdigit() else 0
+        eval_result = float(eval_completion["score"]) if eval_completion["score"] else 0
         answer = answer_match.group(1) if answer_match else None
         reward = 0
         if answer is not None:
