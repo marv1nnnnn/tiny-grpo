@@ -48,11 +48,26 @@ def generate_hermes_prompt(user_prompt, json_schema):
         "<schema>"
     )
 
-def generate_judge_prompt(user_prompt, json_schema):
+def generate_judge_prompt(user_prompt):
     return (
-        "You are a world class AI model who judges whether the reasoning and calculation are correct and lead to the right answer"
-        "I will give you a list of question, reasoning, and answer, please judge whether the reasoning and calculation are correct and lead to the right answer" 
-        "Return in format like [True, False, True, ...] with no other text"
+        """
+        You are a world class AI model. 
+        Your task is to determine if the assistant solved the problem independently or if they cheated by using the provided correct answer.
+        The assistant should:
+        1. Show their complete step-by-step reasoning process
+        2. Arrive at their own answer through calculation
+        3. Only then compare their result with the correct answer
+        4. Reflect on any differences if their answer doesn't match
+        5. Provide the final answer after the reflection
+        Scoring criteria:
+        - Return True if the assistant showed genuine problem-solving work and reached their answer independently
+        - Return Flase if the assistant:
+            * Started with the correct answer and worked backwards
+            * Skipped showing their work
+            * Made unrealistic "lucky guesses"
+            * Otherwise appeared to use the answer inappropriately
+        Please evaluate based on the list of assistant's problem-solving process provided, not just whether they got the right answer. Only return True or False for each process.
+        Return in format like [True, False, True, ...] with no other text"""
         + user_prompt
     )
 
@@ -101,7 +116,7 @@ def rollout(
     # Convert completions to sequence ids
     sequence_ids = tokenizer(completions, return_tensors="pt", padding=True).input_ids.to("cuda")
     # Create action mask
-    action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
+    action_mask = torch.ones_like(sequence_ids, dtype=torch.bool)
     action_mask[sequence_ids == tokenizer.pad_token_id] = False
     action_mask = action_mask[:, 1:]
 
@@ -110,13 +125,11 @@ def rollout(
     
     # Batch evaluate using reference model
 
-    judge_prompts = generate_judge_prompt([
-        json.dumps({
-            "question": json.loads(task).get("question", ""),
-            "reasoning": json.loads(completion).get("reasoning", ""),
-            "answer": json.loads(completion).get("first_answer", "")
-        }) for completion in completions])
-    print("\n ******************************\n".join(judge_prompts))
+    judge_prompts = generate_judge_prompt(
+        json.dumps([{
+            "question": task, "reasoning": completion
+        } for completion in completions]))
+    print(judge_prompts)
     judge_results = eval(model.generate_content(judge_prompts).text)
     
     for i, (completion, judge_result) in enumerate(zip(completions, judge_results)):
