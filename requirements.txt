@@ -1,4 +1,6 @@
-torch==2.5.1 
+jsonformer==0.12.0
+flash_attn==2.7.3
 transformers==4.48.1 
 accelerate==1.3.0
 wandb==0.19.4
+outlines=0.1.14

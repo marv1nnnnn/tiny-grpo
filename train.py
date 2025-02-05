@@ -1,9 +1,12 @@
 from collections.abc import Callable
 import json
+import outlines
+from outlines.fsm.json_schema import convert_json_schema_to_str
+from outlines_core.fsm.json_schema import build_regex_from_schema
 from pathlib import Path
 import random
 import re
-from jsonformer import Jsonformer
+from pydantic import BaseModel, Field
 from typing import Any, Iterator, Optional
 import wandb
 import torch
@@ -19,6 +22,33 @@ from transformers import (
 )
 from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
+
+
+class Reasoning(BaseModel):
+    reasoning: str = Field(..., description="First reasoning process without using answer in input, with complete step-by-step process")
+    first_answer: str = Field(..., descripiton="First answer after reasoning")
+    reflection: str = Field(..., description="Self reflection after comparing with answer in input, if mismatch, reflect where is wrong in reasoning and fix it")
+    final_answer: str = Field(..., description="Final answer after reflection")
+
+class Judge(BaseModel):
+    score: str = Field(..., description="""
+    1.0 if the assistant showed genuine problem-solving work and reached their answer independently, 0.0 if the assistant:
+    * Started with the correct answer and worked backwards
+    * Skipped showing their work
+    * Made unrealistic "lucky guesses"
+    * Otherwise appeared to use the answer inappropriately""", enum=["1.0", "0.0"])
+
+def generate_hermes_prompt(user_prompt, json_schema):
+    return (
+        "<|im_start|>system\n"
+        "You are a world class AI model who answers questions in JSON "
+        f"Here's the json schema you must adhere to:\n<schema>\n{json_schema}\n</schema><|im_end|>\n"
+        "<|im_start|>user\n"
+        + user_prompt
+        + "<|im_end|>"
+        + "\n<|im_start|>assistant\n"
+        "<schema>"
+    )
 
 
 def load_model(
@@ -39,60 +69,6 @@ def load_model(
     return model, tokenizer
 
 
-# DeepSeek Zero system prompt
-system_prompt = """You are a helpful AI assistant solving problems. Follow these steps carefully:
-
-1. First, show your complete step-by-step reasoning process in <think> tags
-   Example: <think>Let me solve this step by step:
-   1. First, I'll...
-   2. Then, I'll...
-   3. Finally, I calculate...</think>
-
-2. State your initial calculated answer in <initial_answer> tags
-   Example: <initial_answer>42</initial_answer>
-
-3. Compare your answer with the correct one and reflect on any differences in <self_reflection> tags
-   Example: <self_reflection>My answer matches/differs from the correct answer because...</self_reflection>
-
-4. Provide your final answer in <answer> tags
-   Example: <answer>42</answer>
-
-Remember to:
-- Show all your work clearly
-- Calculate independently before checking the correct answer
-- Be thorough in your reasoning
-- Use the exact tags as shown above
-"""
-
-system_prompt_v2 = """You are a judge evaluating an AI assistant's math problem solving process.
-
-Your task is to determine if the assistant solved the problem independently or if they cheated by using the provided correct answer.
-
-The assistant should:
-1. Show their complete step-by-step reasoning process
-2. Arrive at their own answer through calculation
-3. Only then compare their result with the correct answer
-4. Reflect on any differences if their answer doesn't match
-5. Provide the final answer after the reflection
-
-Scoring criteria:
-- Return 1.0 if the assistant showed genuine problem-solving work and reached their answer independently
-- Return 0.0 if the assistant:
-  * Started with the correct answer and worked backwards
-  * Skipped showing their work
-  * Made unrealistic "lucky guesses"
-  * Otherwise appeared to use the answer inappropriately
-
-Please evaluate based on the assistant's problem-solving process, not just whether they got the right answer. Only return 1.0 or 0.0.
-"""
-
-json_schema = {
-    "type": "object",
-    "properties": {
-        "score": {"type": "string", "enum": ["1.0", "0.0"]}
-    },
-    "required": ["score"]
-}
 
 @torch.no_grad()
 def rollout(
@@ -106,85 +82,66 @@ def rollout(
     temperature: float = 1.0,
     top_p: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-
     model.eval()
 
-    # 1. format prompt
-    chat_messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": task,
-        },
-    ]
-    chat_prompt = tokenizer.apply_chat_template(
-        chat_messages, tokenize=False, add_generation_prompt=True
-    )
-    model_inputs = tokenizer(
-        [chat_prompt],
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        return_attention_mask=True,
-    ).to("cuda")
+    # Convert Reasoning schema to regex
+    json_schema = Reasoning.model_json_schema()
+    schema_str = convert_json_schema_to_str(json_schema=json_schema)
+    regex_str = build_regex_from_schema(schema_str)
 
-    # duplicate prompt num_rollouts times
-    model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(
-        num_rollouts, 1
-    )
+    judge_schema = Judge.model_json_schema()
+    judge_schema_str = convert_json_schema_to_str(json_schema=judge_schema)
+    judge_regex_str = build_regex_from_schema(judge_schema_str)
 
-    input_ids = model_inputs["input_ids"].repeat(num_rollouts, 1)
-    model_inputs["input_ids"] = input_ids
+    # Setup sampler and generator
+    sampler = outlines.samplers.multinomial(num_rollouts, temperature)
+    generator = outlines.generate.regex(model, regex_str, sampler)
 
-    # 2. sample completions
-    pad_token_id = tokenizer.eos_token_id
-    generation_config = GenerationConfig(
-        do_sample=True,
-        top_p=top_p,
-        temperature=temperature,
-        max_length=max_length,
-        pad_token_id=pad_token_id,
-    )
-    sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
-    completions = tokenizer.batch_decode(
-        sequence_ids[:, input_ids.shape[1] :], skip_special_tokens=True
-    )
+    judge_generator = outlines.generate.regex(model, judge_regex_str)
+    # Format prompt and generate completions in batch
+    prompt = generate_hermes_prompt(task)
+    completions = generator(prompt, max_tokens=max_length)
+    
+    # Convert completions to sequence ids
+    sequence_ids = tokenizer(completions, return_tensors="pt", padding=True).input_ids.to("cuda")
+    input_length = len(tokenizer.encode(generate_hermes_prompt(task)))
 
+    # Create action mask
     action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
-    action_mask[:, input_ids.shape[1] :] = True
-    action_mask[sequence_ids == pad_token_id] = False
+    action_mask[:, input_length:] = True
+    action_mask[sequence_ids == tokenizer.pad_token_id] = False
     action_mask = action_mask[:, 1:]
 
-    eval_completions = [
-        Jsonformer(model=reference_model, tokenizer=tokenizer, schema=json_schema, prompt=system_prompt_v2 + "\n" + completion).generate()
-        for completion in completions
-    ]
-    # 3. determine rewards
+    # Evaluate completions
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
-    for i, (completion, eval_completion) in enumerate(zip(completions, eval_completions)):
-        print(completion, eval_completion)
-        # search answer tag
-        answer_match = re.search(
-            r"<answer>(.*?)</answer>",
-            completion,
-            flags=re.DOTALL,
-        )
-        eval_result = float(eval_completion["score"]) if eval_completion["score"] else 0
-        answer = answer_match.group(1) if answer_match else None
-        reward = 0
-        if answer is not None:
-            if answer == oracle_answer:
-                reward = 1.0
-            elif oracle_answer in answer:
-                reward = 0.5
-            else:
-                reward = 0.01
-        
+    
+    # Batch evaluate using reference model
 
-        returns[i] = reward * eval_result
+    judge_prompts = [generate_hermes_prompt(task + "\n" + completion) for completion in completions]
+    judge_results = judge_generator(judge_prompts, max_tokens=max_length)
+    
+    for i, (completion, judge_result) in enumerate(zip(completions, judge_results)):
+        try:
+            parsed = json.loads(completion)
+            final_answer = parsed.get("final_answer", "")
+            
+            # Calculate reward
+            reward = 0
+            if final_answer:
+                if final_answer == oracle_answer:
+                    reward = 1.0
+                elif oracle_answer in final_answer:
+                    reward = 0.5
+                else:
+                    reward = 0.01
+            
+            judge_parsed = json.loads(judge_result)
+            judge_score = float(judge_parsed.get("score", 0))
+            
+            returns[i] = reward * judge_score
+            
+        except json.JSONDecodeError:
+            returns[i] = 0.0
 
     return sequence_ids, returns.to(sequence_ids.device), action_mask, completions
 
